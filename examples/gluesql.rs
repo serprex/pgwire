@@ -1,8 +1,9 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::stream;
 use tokio::net::TcpListener;
+use tokio::sync;
 
 use gluesql::prelude::*;
 use pgwire::api::auth::noop::NoopStartupHandler;
@@ -13,7 +14,7 @@ use pgwire::error::{PgWireError, PgWireResult};
 use pgwire::tokio::process_socket;
 
 pub struct GluesqlProcessor {
-    glue: Arc<Mutex<Glue<MemoryStorage>>>,
+    tx: Arc<sync::mpsc::Sender<(sync::oneshot::Sender<Result<Vec<Payload>>>, String)>>
 }
 
 #[async_trait]
@@ -27,12 +28,13 @@ impl SimpleQueryHandler for GluesqlProcessor {
         C: ClientInfo + Unpin + Send + Sync,
     {
         println!("{:?}", query);
-        let mut glue = self.glue.lock().unwrap();
-        glue.execute(query)
-            .map_err(|err| PgWireError::ApiError(Box::new(err)))
+        let (tx, rx) = sync::oneshot::channel();
+        self.tx.send((tx, String::from(query))).await.map_err(|err| PgWireError::ApiError(Box::new(err)))?;
+        let payloads = rx.await.map_err(|err| PgWireError::ApiError(Box::new(err)))?;
+        payloads.map_err(|err| PgWireError::ApiError(Box::new(err)))
             .and_then(|payloads| {
                 payloads
-                    .iter()
+                    .into_iter()
                     .map(|payload| match payload {
                         Payload::Select { labels, rows } => {
                             let fields = labels
@@ -137,15 +139,15 @@ impl SimpleQueryHandler for GluesqlProcessor {
                         }
                         Payload::Insert(rows) => Ok(Response::Execution(Tag::new_for_execution(
                             "Insert",
-                            Some(*rows),
+                            Some(rows),
                         ))),
                         Payload::Delete(rows) => Ok(Response::Execution(Tag::new_for_execution(
                             "Delete",
-                            Some(*rows),
+                            Some(rows),
                         ))),
                         Payload::Update(rows) => Ok(Response::Execution(Tag::new_for_execution(
                             "Update",
-                            Some(*rows),
+                            Some(rows),
                         ))),
                         Payload::Create => {
                             Ok(Response::Execution(Tag::new_for_execution("Create", None)))
@@ -177,24 +179,30 @@ impl SimpleQueryHandler for GluesqlProcessor {
 
 #[tokio::main]
 pub async fn main() {
-    let gluesql = GluesqlProcessor {
-        glue: Arc::new(Mutex::new(Glue::new(MemoryStorage::default()))),
-    };
+    let (gluetx, mut gluerx) = sync::mpsc::channel(1);
+    let processor = Arc::new(GluesqlProcessor { tx: Arc::new(gluetx) });
 
-    let processor = Arc::new(StatelessMakeHandler::new(Arc::new(gluesql)));
     // We have not implemented extended query in this server, use placeholder instead
-    let placeholder = Arc::new(StatelessMakeHandler::new(Arc::new(
+    let placeholder = StatelessMakeHandler::new(Arc::new(
         PlaceholderExtendedQueryHandler,
-    )));
-    let authenticator = Arc::new(StatelessMakeHandler::new(Arc::new(NoopStartupHandler)));
+    ));
+    let authenticator = StatelessMakeHandler::new(Arc::new(NoopStartupHandler));
 
     let server_addr = "127.0.0.1:5432";
     let listener = TcpListener::bind(server_addr).await.unwrap();
     println!("Listening to {}", server_addr);
+
+    tokio::spawn(async move {
+        let mut glue = Glue::new(MemoryStorage::default());
+        while let Some((tx, sql)) = gluerx.recv().await {
+            tx.send(futures::executor::block_on(glue.execute(sql))).ok();
+        }
+    });
+
     loop {
         let incoming_socket = listener.accept().await.unwrap();
         let authenticator_ref = authenticator.make();
-        let processor_ref = processor.make();
+        let processor_ref = processor.clone();
         let placeholder_ref = placeholder.make();
         tokio::spawn(async move {
             process_socket(
